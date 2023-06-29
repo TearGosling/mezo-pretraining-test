@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 import torch
 import transformers
 
-from datasets import DataCollatorForMmapedDataset, MmapedArrowDataset
+from datasets import MmappedArrowDataset, DataCollatorForMmapedDataset
 from mezo import MeZOTrainer
 
 @dataclass
@@ -36,7 +36,7 @@ class OtherArguments:
 @dataclass
 class MezoArguments:
     use_mezo: bool = field(
-        metadata={"help": "Use the MeZO optimizer."}
+        metadata={"help": "Use the MeZO optimizer."},
         default=True
     )
     zo_eps: float = field(
@@ -60,7 +60,7 @@ def main() -> None:
         MezoArguments,
         transformers.TrainingArguments,
     ))
-    model_args, data_args, lora_args, other_args, mezo_args, training_args = parser.parse_args_into_dataclasses()
+    model_args, data_args, other_args, mezo_args, training_args = parser.parse_args_into_dataclasses()
 
     tokenizer = transformers.AutoTokenizer.from_pretrained(
         model_args.model_name_or_path,
@@ -84,11 +84,7 @@ def main() -> None:
         model_args.model_name_or_path
     )
 
-    model = transformers.AutoModelForCausalLM.from_config(
-        config,
-        low_cpu_mem_usage=True,
-        torch_dtype=model_load_dtype
-    ).cuda()
+    model = transformers.AutoModelForCausalLM.from_config(config).cuda()
 
     if other_args.add_special_tokens is not None:
         # MAINTENANCE(11b): Big fat warning: the snippet below is copy-pasted

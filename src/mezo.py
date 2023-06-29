@@ -1,4 +1,3 @@
-import logging
 import math
 import os
 import time
@@ -30,7 +29,7 @@ from transformers.trainer_callback import TrainerState
 from transformers.trainer_pt_utils import get_model_param_count, IterableDatasetShard
 from transformers.trainer_utils import has_length, HPSearchBackend, ShardedDDPOption, speed_metrics, TrainOutput
 from transformers.training_args import ParallelMode, TrainingArguments
-from transformers.utils import is_accelerate_available, is_apex_available, is_sagemaker_mp_enabled, is_torch_tpu_available
+from transformers.utils import is_accelerate_available, is_apex_available, is_sagemaker_mp_enabled, is_torch_tpu_available, logging
 
 if is_apex_available():
     from apex import amp
@@ -370,7 +369,7 @@ class MeZOTrainer(Trainer):
 
                 with self.accelerator.accumulate(model):
                     # MeZO added: estimate gradient
-                    if args.use_mezo:
+                    if self.use_mezo:
                         tr_loss_step = self.zo_step(model, inputs)
                     else:
                         tr_loss_step = self.training_step(model, inputs)
@@ -396,7 +395,7 @@ class MeZOTrainer(Trainer):
                     and (step + 1) == steps_in_epoch
                 ):
                     # MeZO added: update model with the estimated gradient
-                    if args.use_mezo:
+                    if self.use_mezo:
                         self.zo_update(model)
                     else:
                         # Gradient clipping
@@ -555,7 +554,7 @@ class MeZOTrainer(Trainer):
                 device=param.data.device,
                 dtype=param.data.dtype
             )
-            param.data = param.data + scaling_factor * z * self.args.zo_eps
+            param.data = param.data + scaling_factor * z * self.zo_eps
 
     def zo_forward(self, model: nn.Module, inputs: t.Any) -> torch.tensor:
         """
@@ -598,7 +597,7 @@ class MeZOTrainer(Trainer):
         self.zo_perturb_parameters(scaling_factor=-2)
         loss2 = self.zo_forward(model, inputs)
 
-        self.projected_grad = ((loss1 - loss2) / (2 * self.args.zo_eps)).item()
+        self.projected_grad = ((loss1 - loss2) / (2 * self.zo_eps)).item()
 
         # Reset model back to its parameters at start of step
         self.zo_perturb_parameters(scaling_factor=1)
