@@ -1,0 +1,7 @@
+datasets
+pyarrow
+scikit-learn
+torch>=2.0.1
+tqdm
+transformers
+wandb
