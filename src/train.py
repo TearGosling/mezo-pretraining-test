@@ -1,196 +1,268 @@
-# I'm too tired to do this properly, just gonna copy paste from the Pyg training code repo
-import pathlib
-import typing as t
+import argparse
+import functools
+import json
+import logging
+import os
+import time
 
-from dataclasses import dataclass, field
-
+import accelerate
+import pyarrow
 import torch
 import transformers
 
-from datasets import MmappedArrowDataset, DataCollatorForMmapedDataset
-from mezo import MeZOTrainer
+from tqdm import tqdm
 
-@dataclass
-class ModelArguments:
-    model_name_or_path: t.Optional[str] = field(
-        default="EleutherAI/pythia-70m-deduped")
+from datasets import MmappedArrowDataset, uft_collate_fn
+from mezo_op import MeZOOptimizer
 
-@dataclass
-class DataArguments:
-    train_file: str = field(metadata={"help": "Path to the training set."})
-    eval_file: str = field(metadata={"help": "Path to the evaluation set."})
+LOG = logging.getLogger(__name__)
+logging.basicConfig(
+    format='[%(asctime)s] [%(levelname)s] %(message)s',
+    level=logging.DEBUG,
+)
 
+# Convert any number to GiB
+GiB = lambda x: x >> 30
+# Get the GPU ID
+GPU_ID = torch.cuda.device().split(":")[-1]
 
-@dataclass
-class OtherArguments:
-    model_load_delay_per_rank: t.Optional[int] = field(metadata={
-        "help": "Delay loading the model by (this many seconds) * (local_rank)."},
-        default=None)
-    add_special_tokens: t.Optional[str] = field(
-        metadata={"help": "Extra special tokens to add to the tokenizer before training. Comma-separated."},
-        default=None)
-    uft: bool = field(
-        metadata={"help": "Use unsupervised fine-tuning instead of supervised fine-tuning."},
-        default=False)
-    
-@dataclass
-class MezoArguments:
-    use_mezo: bool = field(
-        metadata={"help": "Use the MeZO optimizer."},
-        default=True
-    )
-    zo_eps: float = field(
-        metadata={"help": "EPS for MeZO."},
-        default=1e-3
-    )
-    linear_probing: bool = field(
-        metadata={"help": "Use linear probing."},
-        default=False
-    )
-    lp_early_stopping: bool = field(
-        metadata={"help": "Stop linear probing early."},
-        default=False
-    )
+STR_TO_TORCH_DTYPE = {
+    "fp32": torch.float32,
+    "fp16": torch.float16,
+    "bf16": torch.bfloat16
+}
 
-def main() -> None:
-    parser = transformers.HfArgumentParser((
-        ModelArguments,
-        DataArguments,
-        OtherArguments,
-        MezoArguments,
-        transformers.TrainingArguments,
-    ))
-    model_args, data_args, other_args, mezo_args, training_args = parser.parse_args_into_dataclasses()
+class MeZOTrainer:
+    def __init__(
+        self,
+        args: argparse.Namespace
+    ) -> None:
+        # Assignment
+        self.args = args
+        self.num_epochs = args.epochs
+        self.learning_rate = args.learning_rate
+        self.global_step = 0
+        self.local_step = 0
 
-    tokenizer = transformers.AutoTokenizer.from_pretrained(
-        model_args.model_name_or_path,
-        padding_side="right",
-        use_fast=True,
-    )
+        # Load the model and tokenizer up
+        LOG.info("Loading tokenizer...")
+        self.tokenizer = transformers.AutoTokenizer.from_pretrained(args.model_name)
+        LOG.info("Done! Loading model...")
+        self.model = transformers.AutoModelForCausalLM.from_pretrained(
+            args.model_name,
+            low_cpu_mem_usage=True,
+            torch_dtype=STR_TO_TORCH_DTYPE[args.dtype]
+        ).cuda()
+        self.model.eval()
+        LOG.info(f"Done! Model and tokenizer initialized on GPU {GPU_ID} with {GiB(torch.cuda.memory_allocated):.3f} GiB of allocated memory.")
 
-    if other_args.model_load_delay_per_rank is not None:
-        # See comment in PygmalionAI/training-code
-        import time
-        time.sleep(other_args.model_load_delay_per_rank * training_args.local_rank)
-
-    # Model loading.
-    model_load_dtype = None
-    if training_args.bf16:
-        model_load_dtype = torch.bfloat16
-    elif training_args.fp16:
-        model_load_dtype = torch.float16
-
-    config = transformers.AutoConfig.from_pretrained(
-        model_args.model_name_or_path
-    )
-
-    model = transformers.AutoModelForCausalLM.from_config(config).cuda()
-
-    if other_args.add_special_tokens is not None:
-        # MAINTENANCE(11b): Big fat warning: the snippet below is copy-pasted
-        # into ``./preparation/tokenize_data_{sft,uft}.py``. Make sure to always keep both
-        # implementations in sync.
-        special_token_contents = other_args.add_special_tokens.split(",")
-        special_tokens = [
-            transformers.AddedToken(
-                # Heads up: this is very poorly documented in HuggingFace and
-                # some old forum discussions mention that it's apparently
-                # exclusive to the Rust-based tokenizers? If anything seems
-                # funky about the special token behavior, this is a good place
-                # to look.
-                content, lstrip=True, rstrip=True)
-            for content in special_token_contents
-        ]
-
-        _add_special_tokens_to_tokenizer_and_resize_model_embeddings(
-            {"additional_special_tokens": special_tokens},
-            tokenizer,
-            model,
+        # Load optimizer
+        self.optimizer = MeZOOptimizer(
+            # Surely this won't cause any problems
+            # (clueless)
+            trainer=self
         )
 
-    # Silence this annoying warning.
-    if training_args.gradient_checkpointing:
-        model.config.use_cache = False
+        train_dataset = MmappedArrowDataset(args.train_dataset_path, sft=False)
+        eval_dataset = MmappedArrowDataset(args.eval_dataset_path, sft=False)
+        collate_fn = functools.partial(uft_collate_fn, tokenizer=self.tokenizer)
 
-    # Dataset setup.
-    train_dataset = MmappedArrowDataset(data_args.train_file, sft=not other_args.uft)
-    eval_dataset = MmappedArrowDataset(data_args.eval_file, sft=not other_args.uft)
-    data_collator = DataCollatorForMmapedDataset(tokenizer=tokenizer, sft=not other_args.uft)
+        # Load dataloaders
+        self.train_dataloader = torch.utils.data.DataLoader(
+            train_dataset,
+            batch_size=args.batch_size,
+            shuffle=True,
+            collate_fn=collate_fn
+        )
+        self.eval_dataloader = torch.utils.data.DataLoader(
+            eval_dataset,
+            batch_size=args.batch_size,
+            shuffle=True,
+            collate_fn=collate_fn
+        )
 
-    trainer = MeZOTrainer(
-        model=model,
-        tokenizer=tokenizer,
-        train_dataset=train_dataset,
-        eval_dataset=eval_dataset,
-        data_collator=data_collator,
-        args=training_args,
-        use_mezo=mezo_args.use_mezo,
-        zo_eps=mezo_args.zo_eps,
-        linear_probing=mezo_args.linear_probing,
-        lp_early_stopping=mezo_args.lp_early_stopping,
-        callbacks=None,
+        self._init_accelerator()
+
+        if self.accelerator.is_main_process:
+            self.progress_bar = tqdm(
+                total=len(self.train_dataloader)*len(self.eval_dataloader),
+                desc="Training/eval steps",
+                leave=False
+            )
+
+    def train(self):
+        '''MeZO training.'''
+        if self.accelerator.is_main_process:
+            LOG.info("Beginning training loop!")
+        
+        hps = {
+            "base_model": self.model_name,
+            "lr": self.learning_rate,
+        }
+        self.accelerator.init_trackers(self.args.project_name, config=hps)
+
+        for epoch in range(self.num_epochs):
+            LOG.info(f"Beginning epoch {epoch} of training.")
+            for i, batch in enumerate(self.train_dataloader):
+                step_start = time.perf_counter()
+                metrics = self.step(batch, loss_type="train")
+                step_end = time.perf_counter()
+                self.local_step += 1
+
+                if self.accelerator.is_main_process:
+                    rank_samples_per_second = self.args.batch_size / (step_end - step_start)
+                    world_samples_per_second = rank_samples_per_second * self.accelerator.num_processes
+
+                    metrics.update({
+                        "perf/rank_samples_per_second": rank_samples_per_second,
+                        "perf/world_samples_per_second": world_samples_per_second,
+                        "train/epoch": epoch,
+                        "train/samples_seen": self.local_step * self.args.batch_size,
+                    })
+
+                    self.progress_bar.update(1)
+                    self.progress_bar.set_postfix(**metrics)
+
+                    self.accelerator.log(metrics, step=self.local_step)
+
+                if self.local_step % self.args.save_steps == 0:
+                    self.save_model()
+                    # eval
+                    eval_losses = []
+                    if self.accelerator.is_main_process:
+                        progress_bar = tqdm(
+                            total=len(self.eval_dataloader),
+                            desc="Eval steps",
+                            leave=False
+                        )
+
+                    for e_batch in self.eval_dataloader:
+                        loss = self.step(e_batch, loss_type="eval")
+                        loss_type = "eval/loss"
+
+                        eval_losses.append(loss[loss_type])
+                        if self.accelerator.is_main_process:
+                            progress_bar.update(1)
+
+                    eval_losses = torch.cat(eval_losses)
+                    eval_losses = eval_losses[:len(self.eval_dataloader)]
+                    eval_loss = torch.mean(eval_losses)
+                    if self.accelerator.is_main_process:
+                        self.accelerator.log({loss_type: eval_loss}, step=self.local_step)
+
+        LOG.info("Training complete! Saving model...")
+        self.save_model()
+        self.accelerator.end_training()
+
+    def save_model(self):
+        save_path = os.path.join(self.args.save_path, self.args.wandb_project_name)
+        if self.accelerator.is_main_process:
+            os.makedirs(save_path, exist_ok=True)
+
+            state_file_path = os.path.join(save_path, "trainer_state.json")
+            with open(state_file_path, "w") as state_file:
+                state_file.write(json.dumps({
+                    "step": self.local_step()
+                }))
+
+            self.accelerator.wait_for_everyone()
+
+            self.accelerate.save_state(save_path)
+
+    def load_from_checkpoint(self):
+        raise NotImplementedError
+
+    def _init_accelerator(self) -> None:
+        '''Initializes the accelerator and prepares the model and dataloaders.'''
+        self.accelerator = accelerate.Accelerator()
+        accelerate.utils.set_seed(42)
+        self.model, self.train_dataloader, self.eval_dataloader = self.accelerator.prepare(
+            self.model, self.train_dataloader, self.eval_dataloader
+        )
+
+    def step(self, batch: dict, loss_type: str) -> dict:
+        '''Singular training step which can be shared with train or eval.'''
+        with torch.no_grad():
+            loss = self.optimizer.step(batch)
+            self.optimizer.update()
+
+        return {
+            f"{loss_type}/loss": loss
+        }
+
+def _parse_args_from_argv() -> argparse.Namespace:
+    '''Parses arguments'''
+    parser = argparse.ArgumentParser(prog="MeZO Trainer", description="Trains/fine-tunes a model using the MeZO algorithm")
+
+    ### MODEL ARGS ###
+    parser.add_argument(
+        "--model-name",
+        required=True,
+        help="The HuggingFace model name or path to a local checkpoint"
+    )
+    parser.add_argument(
+        "--dtype",
+        default="fp32",
+        help="The dtype to train the model in"
     )
 
-    try:
-        # Resume from checkpoint if we have any checkpoints automatically saved
-        # by the HF Trainer within the output directory.
-        resume_from_checkpoint = len(
-            list(pathlib.Path(
-                training_args.output_dir).glob("checkpoint-*"))) > 0
+    ### TRAINING ARGS ###
+    parser.add_argument(
+        "--wandb-project-name",
+        default="new-mezo-trainer",
+        help="The name of the wandb project."
+    )
+    parser.add_argument(
+        "--save-steps",
+        required=True,
+        help="When to save the model"
+    )
 
-        trainer.train(resume_from_checkpoint=resume_from_checkpoint)
+    ### HYPERPARAMETERS ###
+    parser.add_argument(
+        "--batch-size",
+        required=True,
+        help="Batch size"
+    )
+    parser.add_argument(
+        "--learning-rate",
+        required=True,
+        help="Learning rate"
+    )
+    parser.add_argument(
+        "--eps",
+        default=1e-3,
+        help="EPS"
+    )
+    parser.add_argument(
+        "--weight_decay",
+        default=0.,
+        help="Weight decay"
+    )
 
-    except KeyboardInterrupt as ex:
-        # TODO(11b): Test whether this does what I expect. Idea is to have the
-        # trainer save the current state when I interrupt the run so I don't
-        # need to keep waiting for a checkpoint step.
-        # trainer.save_model()
-        # trainer.save_state()
-        raise ex
+    ### PATHS ###
+    parser.add_argument(
+        "--train-dataset",
+        required=True,
+        help="Path to the pyarrow file for the training dataset"
+    )
+    parser.add_argument(
+        "--eval-dataset",
+        required=True,
+        help="Path to the pyarrow file for the eval dataset"
+    )
+    parser.add_argument(
+        "--save-path",
+        required=True,
+        help="Save the model in this directory"
+    )
 
-    trainer.save_state()
-    trainer.save_model()
+    return parser.parse_args()
 
-def _add_special_tokens_to_tokenizer_and_resize_model_embeddings(
-    special_tokens: t.Dict[str, t.Union[str, transformers.AddedToken]],
-    tokenizer: transformers.PreTrainedTokenizerBase,
-    model: transformers.PreTrainedModel,
-):
-    tokenizer.add_special_tokens(special_tokens)
-
-    # Size is rounded up to the nearest number divisible by 64 for performance
-    # reasons.
-    new_size = _nearest_divisible(num=len(tokenizer), divisor=64)
-    old_size = model.config.vocab_size
-
-    if new_size == old_size:
-        # No resizing needs to be done, let's bail!
-        return
-
-    # Need to resize the token embeddings. We initialize the new positions with
-    # the mean of the existing ones to cut down on required training time.
-    model.resize_token_embeddings(new_size)
-    new_positions_count = new_size - old_size
-
-    input_embeddings = model.get_input_embeddings().weight.data
-    output_embeddings = model.get_output_embeddings().weight.data
-
-    # This is just to keep the LSP happy.
-    assert isinstance(input_embeddings, torch.Tensor)
-    assert isinstance(output_embeddings, torch.Tensor)
-
-    input_embeddings_avg = input_embeddings[:-new_positions_count].mean(dim=0,
-                                                             keepdim=True)
-    output_embeddings_avg = output_embeddings[:-new_positions_count].mean(dim=0,
-                                                               keepdim=True)
-
-    input_embeddings[-new_positions_count:] = input_embeddings_avg
-    output_embeddings[-new_positions_count:] = output_embeddings_avg
-
-
-def _nearest_divisible(num: int, divisor: int) -> int:
-    '''Returns the nearest number to `num` that is divisible by `divisor`.'''
-    return (num + divisor - 1) // divisor * divisor
+def main() -> None:
+    args = _parse_args_from_argv()
+    trainer = MeZOTrainer(args)
+    trainer.train()
 
 if __name__ == "__main__":
     main()
